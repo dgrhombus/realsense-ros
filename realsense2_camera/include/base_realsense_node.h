@@ -322,7 +322,10 @@ namespace realsense2_camera
         void imu_callback_sync(rs2::frame frame, imu_sync_method sync_method=imu_sync_method::COPY);
         void multiple_message_callback(rs2::frame frame, imu_sync_method sync_method);
         void frame_callback(rs2::frame frame);
-        
+        // Rhombus: tee a color frame to a v4l2loopback OUTPUT device so a second
+        // consumer (video-agent) can read RGB while librealsense owns the camera.
+        void teeColorToV4l2Loopback(const rs2::video_frame& color_frame);
+
         void startDiagnosticsUpdater();
         void monitoringProfileChanges();
         void publish_temperature();
@@ -348,6 +351,19 @@ namespace realsense2_camera
         std::map<std::string, std::function<void(rs2::frame)>> _sensors_callback;
 
         std::string _json_file_path;
+
+        // Rhombus: color → v4l2loopback tee. When _color_loopback_device is
+        // non-empty (set via the "color_v4l2loopback_device" param), frame_callback
+        // writes each color frame to that v4l2 OUTPUT device so video-agent can
+        // read the RGB feed via v4l2src while librealsense keeps exclusive
+        // ownership of the camera for color RGB-D SLAM. Empty (default) = disabled,
+        // so no other platform's behaviour changes.
+        std::string _color_loopback_device;
+        int _color_loopback_fd = -1;
+        uint32_t _color_loopback_w = 0;
+        uint32_t _color_loopback_h = 0;
+        std::vector<uint8_t> _color_loopback_buf;
+
         float _depth_scale_meters;
         float _clipping_distance;
 

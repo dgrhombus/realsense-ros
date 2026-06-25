@@ -28,6 +28,13 @@ void BaseRealSenseNode::getParameters()
     _camera_name = _parameters->setParam<std::string>(param_name, "camera");
     _parameters_names.push_back(param_name);
 
+    // Rhombus: optional v4l2loopback device to tee the color stream into so a
+    // second consumer (video-agent) can read RGB while librealsense owns the
+    // camera. Empty (default) = disabled, so non-Rhombus configs are unaffected.
+    param_name = std::string("color_v4l2loopback_device");
+    _color_loopback_device = _parameters->setParam<std::string>(param_name, "");
+    _parameters_names.push_back(param_name);
+
     param_name = std::string("publish_tf");
     _publish_tf = _parameters->setParam<bool>(param_name, PUBLISH_TF);
     _parameters_names.push_back(param_name);

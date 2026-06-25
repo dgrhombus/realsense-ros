@@ -16,6 +16,13 @@
 #include "assert.h"
 #include <algorithm>
 #include <mutex>
+// Rhombus: color → v4l2loopback tee (see teeColorToV4l2Loopback).
+#include <fcntl.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
 #include <rclcpp/clock.hpp>
 #include <fstream>
 #include <image_publisher.h>
@@ -579,6 +586,12 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
         rs2::video_frame original_color_frame = frameset.get_color_frame();
         rs2::video_frame original_infra2_frame = frameset.get_infrared_frame(2);
 
+        // Rhombus: tee the raw color frame to the v4l2loopback (if configured)
+        // before filters/publish — lowest-latency hand-off to video-agent, which
+        // reads the loopback while librealsense keeps the physical camera.
+        if (original_color_frame && !_color_loopback_device.empty())
+            teeColorToV4l2Loopback(original_color_frame);
+
         ROS_DEBUG("num_filters: %d", static_cast<int>(_filters.size()));
         for (auto filter_it : _filters)
         {
@@ -673,6 +686,9 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
                     clip_depth(frame, _clipping_distance);
                 }
             }
+            // Rhombus: tee single (unsynced) color frames to the loopback too.
+            if (stream_type == RS2_STREAM_COLOR && frame.is<rs2::video_frame>() && !_color_loopback_device.empty())
+                teeColorToV4l2Loopback(frame.as<rs2::video_frame>());
             publishFrame(frame, t, sip, _images, _info_publishers, _image_publishers);
         }
     }
@@ -689,6 +705,114 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
     if (_synced_imu_publisher)
         _synced_imu_publisher->Resume();
 } // frame_callback
+
+// Rhombus: tee a color frame into a v4l2loopback OUTPUT device so a second,
+// unrelated consumer (video-agent's gstreamer v4l2src) can read the RGB feed
+// while librealsense keeps exclusive ownership of the camera for color RGB-D
+// SLAM (V4L2 and librealsense cannot share one UVC interface). Runs on the
+// librealsense callback thread — no DDS/ROS in the path. Enabled only when the
+// "color_v4l2loopback_device" param is set (empty default = no-op).
+void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_frame)
+{
+    const uint32_t w = static_cast<uint32_t>(color_frame.get_width()) & ~1u;  // YUYV pairs need even width
+    const uint32_t h = static_cast<uint32_t>(color_frame.get_height());
+    if (w == 0 || h == 0)
+        return;
+
+    // (Re)open the loopback OUTPUT device on first use or geometry change.
+    if (_color_loopback_fd < 0 || w != _color_loopback_w || h != _color_loopback_h)
+    {
+        if (_color_loopback_fd >= 0)
+        {
+            ::close(_color_loopback_fd);
+            _color_loopback_fd = -1;
+        }
+        int fd = ::open(_color_loopback_device.c_str(), O_WRONLY);
+        if (fd < 0)
+        {
+            ROS_WARN_STREAM("color v4l2loopback: cannot open " << _color_loopback_device
+                            << ": " << std::strerror(errno));
+            return;
+        }
+        struct v4l2_format fmt;
+        std::memset(&fmt, 0, sizeof(fmt));
+        fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        fmt.fmt.pix.width = w;
+        fmt.fmt.pix.height = h;
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+        fmt.fmt.pix.field = V4L2_FIELD_NONE;
+        fmt.fmt.pix.bytesperline = w * 2;
+        fmt.fmt.pix.sizeimage = w * h * 2;
+        fmt.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
+        if (::ioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
+        {
+            ROS_WARN_STREAM("color v4l2loopback: VIDIOC_S_FMT " << w << "x" << h << " YUYV on "
+                            << _color_loopback_device << " failed: " << std::strerror(errno));
+            ::close(fd);
+            return;
+        }
+        _color_loopback_fd = fd;
+        _color_loopback_w = w;
+        _color_loopback_h = h;
+        _color_loopback_buf.resize(static_cast<size_t>(w) * h * 2);
+        ROS_INFO_STREAM("color v4l2loopback: streaming " << w << "x" << h << " YUYV to "
+                        << _color_loopback_device);
+    }
+
+    const rs2_format src_fmt = color_frame.get_profile().format();
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(color_frame.get_data());
+    const int src_stride = color_frame.get_stride_in_bytes();
+    uint8_t* dst = _color_loopback_buf.data();
+
+    if (src_fmt == RS2_FORMAT_YUYV)
+    {
+        // Native format — straight copy (zero conversion, lowest cost).
+        const size_t row = static_cast<size_t>(w) * 2;
+        for (uint32_t y = 0; y < h; ++y)
+            std::memcpy(dst + y * row, src + static_cast<size_t>(y) * src_stride, row);
+    }
+    else if (src_fmt == RS2_FORMAT_RGB8 || src_fmt == RS2_FORMAT_BGR8)
+    {
+        const int ri = (src_fmt == RS2_FORMAT_RGB8) ? 0 : 2;
+        const int bi = (src_fmt == RS2_FORMAT_RGB8) ? 2 : 0;
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            const uint8_t* sp = src + static_cast<size_t>(y) * src_stride;
+            uint8_t* dp = dst + static_cast<size_t>(y) * w * 2;
+            for (uint32_t x = 0; x < w; x += 2)
+            {
+                const uint8_t* p0 = sp + static_cast<size_t>(x) * 3;
+                const uint8_t* p1 = p0 + 3;
+                const int r0 = p0[ri], g0 = p0[1], b0 = p0[bi];
+                const int r1 = p1[ri], g1 = p1[1], b1 = p1[bi];
+                const int y0 = (77 * r0 + 150 * g0 + 29 * b0) >> 8;
+                const int y1 = (77 * r1 + 150 * g1 + 29 * b1) >> 8;
+                const int rr = (r0 + r1) >> 1, gg = (g0 + g1) >> 1, bb = (b0 + b1) >> 1;
+                int u = ((-43 * rr - 84 * gg + 127 * bb) >> 8) + 128;
+                int v = ((127 * rr - 106 * gg - 21 * bb) >> 8) + 128;
+                u = u < 0 ? 0 : (u > 255 ? 255 : u);
+                v = v < 0 ? 0 : (v > 255 ? 255 : v);
+                const int yy0 = y0 < 0 ? 0 : (y0 > 255 ? 255 : y0);
+                const int yy1 = y1 < 0 ? 0 : (y1 > 255 ? 255 : y1);
+                *dp++ = static_cast<uint8_t>(yy0);
+                *dp++ = static_cast<uint8_t>(u);
+                *dp++ = static_cast<uint8_t>(yy1);
+                *dp++ = static_cast<uint8_t>(v);
+            }
+        }
+    }
+    else
+    {
+        ROS_WARN_STREAM("color v4l2loopback: unsupported color format "
+                        << rs2_format_to_string(src_fmt) << " (need RGB8/BGR8/YUYV)");
+        return;
+    }
+
+    const ssize_t want = static_cast<ssize_t>(_color_loopback_buf.size());
+    if (::write(_color_loopback_fd, _color_loopback_buf.data(), _color_loopback_buf.size()) != want)
+        ROS_WARN_STREAM("color v4l2loopback: short/failed write to " << _color_loopback_device
+                        << ": " << std::strerror(errno));
+}
 
 void BaseRealSenseNode::multiple_message_callback(rs2::frame frame, imu_sync_method sync_method)
 {

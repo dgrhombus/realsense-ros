@@ -99,6 +99,7 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'depth_mapping_camera.labeled_point_cloud_profile', 'default': '0,0,0', 'description': "'Label PointCloud stream profile'"},
                            {'name': 'enable_occupancy',             'default': 'false', 'description': "'enable occupancy stream'"},
                            {'name': 'depth_mapping_camera.occupancy_profile', 'default': '0,0,0', 'description': "'Occupancy stream profile'"},
+                           {'name': 'color_v4l2loopback_device',    'default': "''", 'description': 'Rhombus: v4l2loopback device to tee the color stream into (e.g. /dev/video40) so the video-agent can read RGB while librealsense owns the camera. Empty = disabled. Must be declared here or rs_launch.py drops the arg before it reaches the node.'},
                           ]
 
 def declare_configurable_parameters(parameters):
