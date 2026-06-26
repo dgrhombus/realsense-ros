@@ -727,7 +727,12 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
             ::close(_color_loopback_fd);
             _color_loopback_fd = -1;
         }
-        int fd = ::open(_color_loopback_device.c_str(), O_WRONLY);
+        // O_NONBLOCK: never let a slow/stalled consumer (video-agent) block the
+        // librealsense capture thread. A full v4l2loopback ring returns EAGAIN on
+        // write and we drop the frame (see below) instead of freezing capture,
+        // which would otherwise throttle the color + aligned-depth ROS topics and
+        // starve RTAB-Map's rgbd_sync.
+        int fd = ::open(_color_loopback_device.c_str(), O_WRONLY | O_NONBLOCK);
         if (fd < 0)
         {
             ROS_WARN_STREAM("color v4l2loopback: cannot open " << _color_loopback_device
@@ -808,10 +813,28 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
         return;
     }
 
+    // Non-blocking write: if the loopback ring is full (consumer not keeping up)
+    // the write returns -1/EAGAIN — drop this frame rather than block the capture
+    // thread. Warnings are rate-limited via a drop counter (this runs on the single
+    // librealsense callback thread, so no locking is needed) so a lagging consumer
+    // can't spam the log at frame rate.
     const ssize_t want = static_cast<ssize_t>(_color_loopback_buf.size());
-    if (::write(_color_loopback_fd, _color_loopback_buf.data(), _color_loopback_buf.size()) != want)
-        ROS_WARN_STREAM("color v4l2loopback: short/failed write to " << _color_loopback_device
-                        << ": " << std::strerror(errno));
+    const ssize_t wrote = ::write(_color_loopback_fd, _color_loopback_buf.data(),
+                                  _color_loopback_buf.size());
+    if (wrote != want)
+    {
+        const int werrno = errno;
+        // ~5 s between warnings at 30 fps.
+        if ((_color_loopback_drop_count++ % 150) == 0)
+        {
+            if (werrno == EAGAIN || werrno == EWOULDBLOCK)
+                ROS_WARN_STREAM("color v4l2loopback: ring full on " << _color_loopback_device
+                                << " — dropping color frames (consumer not keeping up)");
+            else
+                ROS_WARN_STREAM("color v4l2loopback: short/failed write to " << _color_loopback_device
+                                << ": " << std::strerror(werrno));
+        }
+    }
 }
 
 void BaseRealSenseNode::multiple_message_callback(rs2::frame frame, imu_sync_method sync_method)

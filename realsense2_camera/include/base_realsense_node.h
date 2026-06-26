@@ -363,6 +363,7 @@ namespace realsense2_camera
         uint32_t _color_loopback_w = 0;
         uint32_t _color_loopback_h = 0;
         std::vector<uint8_t> _color_loopback_buf;
+        unsigned _color_loopback_drop_count = 0;  // rate-limits ring-full warnings
 
         float _depth_scale_meters;
         float _clipping_distance;
