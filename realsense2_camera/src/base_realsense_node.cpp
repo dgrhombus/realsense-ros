@@ -643,7 +643,12 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
                         continue;
                     }
                 }
-                publishFrame(f, t, sip, _images, _info_publishers, _image_publishers);
+                // Rhombus: color takes the reduced publish path when configured
+                // (the loopback tee above already got the full-res frame).
+                if (stream_type == RS2_STREAM_COLOR && colorRosReduceEnabled())
+                    publishDownscaledColor(f, t);
+                else
+                    publishFrame(f, t, sip, _images, _info_publishers, _image_publishers);
             }
         }
         if (original_depth_frame && _align_depth_filter->is_enabled())
@@ -689,7 +694,12 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
             // Rhombus: tee single (unsynced) color frames to the loopback too.
             if (stream_type == RS2_STREAM_COLOR && frame.is<rs2::video_frame>() && !_color_loopback_device.empty())
                 teeColorToV4l2Loopback(frame.as<rs2::video_frame>());
-            publishFrame(frame, t, sip, _images, _info_publishers, _image_publishers);
+            // Rhombus: color takes the reduced publish path when configured
+            // (the tee above already got the full-res frame).
+            if (stream_type == RS2_STREAM_COLOR && colorRosReduceEnabled())
+                publishDownscaledColor(frame, t);
+            else
+                publishFrame(frame, t, sip, _images, _info_publishers, _image_publishers);
         }
     }
     else if (frame.is<rs2::labeled_points>())
@@ -835,6 +845,133 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
                                 << ": " << std::strerror(werrno));
         }
     }
+}
+
+// Rhombus: reduced-rate/reduced-resolution ROS publish path for the color
+// stream, used instead of publishFrame when color_ros_frame_skip and/or
+// color_ros_downscale are set. The v4l2loopback tee always receives the full
+// sensor frames before this runs — this only affects what DDS carries. With
+// color_ros_frame_skip N, only every Nth frame is published and skipped frames
+// do no conversion or serialization work at all. With color_ros_downscale N,
+// the published image is nearest-neighbor-decimated YUYV (output pixel i
+// samples source pixel i*N; chroma rides along from the sampled macropixel)
+// and color/camera_info carries intrinsics scaled to match, so downstream
+// depth registration reprojects into the reduced geometry automatically. The
+// unscaled factory intrinsics stay available on color/camera_info_full for
+// consumers of the full-res loopback frames: the docking ArUco handler latches
+// CameraInfo once and hard-drops frames whose size mismatches it.
+void BaseRealSenseNode::publishDownscaledColor(rs2::frame f, const rclcpp::Time& t)
+{
+    if (_color_ros_frame_skip > 1 &&
+        (_color_ros_frame_counter++ % static_cast<uint64_t>(_color_ros_frame_skip)) != 0)
+        return;
+
+    const int factor = _color_ros_downscale;
+    if (factor <= 1)
+    {
+        // Frame-skip only: kept frames publish full-res through the stock path.
+        publishFrame(f, t, COLOR, _images, _info_publishers, _image_publishers);
+        return;
+    }
+
+    auto vf = f.as<rs2::video_frame>();
+    if (!vf || vf.get_profile().format() != RS2_FORMAT_YUYV)
+    {
+        // Downscale is implemented for the fleet's native YUYV only. Keep the
+        // stream flowing via the stock path, but say so once — silently
+        // publishing full resolution would mask a misconfiguration.
+        if (!_color_ros_downscale_warned)
+        {
+            _color_ros_downscale_warned = true;
+            ROS_ERROR_STREAM("color_ros_downscale=" << factor
+                             << " requires YUYV color, got "
+                             << rs2_format_to_string(vf ? vf.get_profile().format()
+                                                        : RS2_FORMAT_ANY)
+                             << " — publishing full resolution");
+        }
+        publishFrame(f, t, COLOR, _images, _info_publishers, _image_publishers);
+        return;
+    }
+
+    const uint32_t src_w = static_cast<uint32_t>(vf.get_width());
+    const uint32_t src_h = static_cast<uint32_t>(vf.get_height());
+    const uint32_t dst_w = (src_w / factor) & ~1u;  // YUYV macropixels: even width
+    const uint32_t dst_h = src_h / factor;
+    if (dst_w == 0 || dst_h == 0)
+        return;
+
+    if (_image_publishers.find(COLOR) != _image_publishers.end() &&
+        0 != _image_publishers.at(COLOR)->get_subscription_count())
+    {
+        // Decimate straight into the outgoing message — this writes 1/N² of
+        // the bytes the stock full-res copy moves.
+        sensor_msgs::msg::Image::UniquePtr img(new sensor_msgs::msg::Image());
+        img->header.frame_id = OPTICAL_FRAME_ID(COLOR);
+        img->header.stamp = t;
+        img->width = dst_w;
+        img->height = dst_h;
+        img->encoding = _rs_format_to_ros_format[RS2_FORMAT_YUYV];
+        img->is_bigendian = false;
+        img->step = dst_w * 2;
+        img->data.resize(static_cast<size_t>(img->step) * dst_h);
+
+        const uint8_t* src = static_cast<const uint8_t*>(vf.get_data());
+        const size_t src_stride = static_cast<size_t>(vf.get_stride_in_bytes());
+        for (uint32_t y = 0; y < dst_h; ++y)
+        {
+            const uint8_t* sp = src + static_cast<size_t>(y) * factor * src_stride;
+            uint8_t* dp = img->data.data() + static_cast<size_t>(y) * img->step;
+            for (uint32_t x = 0; x < dst_w; x += 2)
+            {
+                const uint32_t s0 = x * factor;
+                const uint32_t s1 = (x + 1) * factor;
+                const uint8_t* m0 = sp + (s0 & ~1u) * 2;  // macropixel holding s0
+                *dp++ = sp[s0 * 2];  // Y of source pixel s0
+                *dp++ = m0[1];       // U
+                *dp++ = sp[s1 * 2];  // Y of source pixel s1
+                *dp++ = m0[3];       // V
+            }
+        }
+        _image_publishers.at(COLOR)->publish(std::move(img));
+    }
+
+    if (_info_publishers.find(COLOR) != _info_publishers.end())
+    {
+        auto& cam_info = _camera_info.at(COLOR);
+        // Lazy (re)fill on first use / profile change, same as publishFrame.
+        if (cam_info.width != src_w)
+        {
+            updateStreamCalibData(f.get_profile().as<rs2::video_stream_profile>());
+        }
+        cam_info.header.stamp = t;
+
+        if (0 != _info_publishers.at(COLOR)->get_subscription_count())
+        {
+            sensor_msgs::msg::CameraInfo scaled = cam_info;
+            scaled.width = dst_w;
+            scaled.height = dst_h;
+            const double inv = 1.0 / factor;
+            scaled.k[0] *= inv;  // fx
+            scaled.k[2] *= inv;  // cx
+            scaled.k[4] *= inv;  // fy
+            scaled.k[5] *= inv;  // cy
+            scaled.p[0] *= inv;
+            scaled.p[2] *= inv;
+            scaled.p[5] *= inv;
+            scaled.p[6] *= inv;
+            // Distortion coefficients operate on normalized coordinates —
+            // unchanged by scaling.
+            _info_publishers.at(COLOR)->publish(scaled);
+        }
+
+        if (_color_full_info_publisher &&
+            0 != _color_full_info_publisher->get_subscription_count())
+        {
+            _color_full_info_publisher->publish(cam_info);
+        }
+    }
+
+    publishMetadata(f, t, OPTICAL_FRAME_ID(COLOR));
 }
 
 void BaseRealSenseNode::multiple_message_callback(rs2::frame frame, imu_sync_method sync_method)

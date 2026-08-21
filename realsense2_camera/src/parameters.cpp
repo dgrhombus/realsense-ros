@@ -35,6 +35,35 @@ void BaseRealSenseNode::getParameters()
     _color_loopback_device = _parameters->setParam<std::string>(param_name, "");
     _parameters_names.push_back(param_name);
 
+    // Rhombus: reduced ROS publish for the color stream. The loopback tee above
+    // always carries the full sensor resolution/rate (video-agent needs 720p30);
+    // the ROS consumers (depth registration, rgbd_sync) don't, and full-res
+    // color is ~55 MB/s of DDS per camera. color_ros_frame_skip N publishes
+    // every Nth color frame (skipped frames do no conversion/serialization
+    // work); color_ros_downscale N publishes 1/N-size YUYV with intrinsics
+    // scaled to match on color/camera_info, while the unscaled factory
+    // intrinsics move to color/camera_info_full for consumers of the full-res
+    // loopback frames (docking ArUco). Defaults (1/1) keep stock behaviour.
+    param_name = std::string("color_ros_downscale");
+    _color_ros_downscale = _parameters->setParam<int>(param_name, 1);
+    if (_color_ros_downscale < 1)
+    {
+        ROS_ERROR_STREAM("invalid color_ros_downscale " << _color_ros_downscale
+                         << " (must be >= 1) — using 1 (no downscale)");
+        _color_ros_downscale = 1;
+    }
+    _parameters_names.push_back(param_name);
+
+    param_name = std::string("color_ros_frame_skip");
+    _color_ros_frame_skip = _parameters->setParam<int>(param_name, 1);
+    if (_color_ros_frame_skip < 1)
+    {
+        ROS_ERROR_STREAM("invalid color_ros_frame_skip " << _color_ros_frame_skip
+                         << " (must be >= 1) — using 1 (publish every frame)");
+        _color_ros_frame_skip = 1;
+    }
+    _parameters_names.push_back(param_name);
+
     param_name = std::string("publish_tf");
     _publish_tf = _parameters->setParam<bool>(param_name, PUBLISH_TF);
     _parameters_names.push_back(param_name);

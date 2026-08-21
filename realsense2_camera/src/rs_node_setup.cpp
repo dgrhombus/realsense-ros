@@ -208,6 +208,8 @@ void BaseRealSenseNode::stopPublishers(const std::vector<stream_profile>& profil
             _info_publishers.erase(sip);
             _depth_aligned_image_publishers.erase(sip);
             _depth_aligned_info_publisher.erase(sip);
+            if (sip == COLOR)
+                _color_full_info_publisher.reset();  // Rhombus: paired with _info_publishers[COLOR]
             if(profile.stream_type() == RS2_STREAM_LABELED_POINT_CLOUD && _labeled_pointcloud_publisher)
             {
                 _labeled_pointcloud_publisher.reset();
@@ -305,6 +307,18 @@ void BaseRealSenseNode::startPublishers(const std::vector<stream_profile>& profi
                 {
                     _info_publishers[sip] = _node.create_publisher<sensor_msgs::msg::CameraInfo>(camera_info.str(),
                                     rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(info_qos), info_qos));
+
+                    // Rhombus: with a downscaled ROS color publish, the main
+                    // camera_info topic carries intrinsics scaled to the
+                    // published image; the unscaled factory intrinsics stay
+                    // available here for consumers of the full-res loopback
+                    // frames (docking ArUco). See publishDownscaledColor.
+                    if (sip == COLOR && _color_ros_downscale > 1)
+                    {
+                        _color_full_info_publisher = _node.create_publisher<sensor_msgs::msg::CameraInfo>(
+                                        camera_info.str() + "_full",
+                                        rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(info_qos), info_qos));
+                    }
                 }
 
                 if (_align_depth_filter->is_enabled() && (sip != DEPTH) && sip.second < 2)

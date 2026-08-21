@@ -325,6 +325,12 @@ namespace realsense2_camera
         // Rhombus: tee a color frame to a v4l2loopback OUTPUT device so a second
         // consumer (video-agent) can read RGB while librealsense owns the camera.
         void teeColorToV4l2Loopback(const rs2::video_frame& color_frame);
+        // Rhombus: reduced ROS publish path for the color stream (frame skip
+        // and/or YUYV downscale with intrinsics scaled to match); replaces
+        // publishFrame for COLOR when active. See the definition for rationale.
+        void publishDownscaledColor(rs2::frame f, const rclcpp::Time& t);
+        bool colorRosReduceEnabled() const
+            { return _color_ros_downscale > 1 || _color_ros_frame_skip > 1; }
 
         void startDiagnosticsUpdater();
         void monitoringProfileChanges();
@@ -364,6 +370,16 @@ namespace realsense2_camera
         uint32_t _color_loopback_h = 0;
         std::vector<uint8_t> _color_loopback_buf;
         unsigned _color_loopback_drop_count = 0;  // rate-limits ring-full warnings
+
+        // Rhombus: reduced-rate/resolution ROS color publish (see
+        // publishDownscaledColor). The loopback tee above always carries the
+        // full sensor frames and is unaffected by these. All state below is
+        // touched only on the librealsense callback thread — no locking.
+        int _color_ros_downscale = 1;    // "color_ros_downscale" param (1 = off)
+        int _color_ros_frame_skip = 1;   // "color_ros_frame_skip" param (1 = off)
+        uint64_t _color_ros_frame_counter = 0;
+        bool _color_ros_downscale_warned = false;  // one-shot non-YUYV fallback warning
+        rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr _color_full_info_publisher;
 
         float _depth_scale_meters;
         float _clipping_distance;
