@@ -18,6 +18,8 @@
 #include <rclcpp/qos.hpp>
 #include "pointcloud_filter.h"
 #include "align_depth_filter.h"
+// Rhombus: _exit for the frame-stall watchdog.
+#include <unistd.h>
 
 using namespace realsense2_camera;
 using namespace rs2;
@@ -76,6 +78,38 @@ void BaseRealSenseNode::monitoringProfileChanges()
                 #if defined (ACCELERATE_GPU_WITH_GLSL)
                     _is_accelerate_gpu_with_glsl_changed = false;
                 #endif
+            }
+
+            // Rhombus: frame-stall watchdog (see frame_stall_exit_sec in
+            // getParameters()). This thread wakes at least every
+            // time_interval, and it is the SAME thread that executes
+            // updateSensors() above, so the check can never observe a
+            // mid-reconfiguration frame gap. A stall while armed means the
+            // device died under a live handle (kernel V4L2 teardown,
+            // silent link wedge) — librealsense has no recovery for that
+            // state and spins QBUF errors at frame rate, so hand the
+            // process to the supervisor's restart ladder. _exit, not exit:
+            // atexit teardown of a wedged librealsense context can hang
+            // forever on dead USB control transfers; the kernel reclaims
+            // the fds either way (precedent: realsense_node_factory exits
+            // on wait_for_device_timeout expiry).
+            if (_is_running && _frame_stall_exit_sec > 0. &&
+                _frame_stall_armed.load(std::memory_order_relaxed))
+            {
+                const int64_t last_ms = _last_frame_ms.load(std::memory_order_relaxed);
+                const int64_t now_ms = monotonicMs();
+                const int64_t limit_ms = static_cast<int64_t>(_frame_stall_exit_sec * 1000.);
+                if (last_ms > 0 && now_ms - last_ms > limit_ms)
+                {
+                    ROS_FATAL_STREAM("frame-stall watchdog: no frames for "
+                                     << (now_ms - last_ms) / 1000
+                                     << "s while streaming (limit "
+                                     << _frame_stall_exit_sec
+                                     << "s) — device stalled or gone; exiting "
+                                     << "for supervisor restart");
+                    fflush(nullptr);
+                    _exit(1);
+                }
             }
         }
     };
@@ -485,6 +519,16 @@ void BaseRealSenseNode::stopRequiredSensors()
                     // No need to start/stop sensors if align_depth was changed
                     ROS_INFO_STREAM("Stopping Sensor: " << module_name);
                     sensor->stop();
+                    if (is_video_sensor)
+                    {
+                        // Rhombus: intentional stop — the watchdog must not
+                        // read the ensuing frame gap as a stall. Coarse (one
+                        // flag for all video sensors): a mixed state where
+                        // another video sensor still streams just leaves the
+                        // watchdog disarmed until startUpdatedSensors rearms
+                        // it — a missed-detection window, never a false exit.
+                        _frame_stall_armed.store(false, std::memory_order_relaxed);
+                    }
                 }
                 stopPublishers(active_profiles);
             }
@@ -543,6 +587,14 @@ void BaseRealSenseNode::startUpdatedSensors()
                         // No need to start/stop sensors if align_depth was changed
                         ROS_INFO_STREAM("Starting Sensor: " << module_name);
                         sensor->start(wanted_profiles);
+                        if (is_video_sensor)
+                        {
+                            // Rhombus: (re)arm the frame-stall watchdog from
+                            // stream start — a sensor that starts but never
+                            // delivers a frame must also trip it.
+                            _last_frame_ms.store(monotonicMs(), std::memory_order_relaxed);
+                            _frame_stall_armed.store(true, std::memory_order_relaxed);
+                        }
                     }
 
                     if (sensor->rs2::sensor::is<rs2::depth_sensor>())
@@ -632,6 +684,9 @@ void BaseRealSenseNode::handleHWReset(const std_srvs::srv::Empty::Request::Share
     {
         try
         {
+            // Rhombus: deliberate reset ahead — disarm the frame-stall
+            // watchdog before the frame gap it causes.
+            _frame_stall_armed.store(false, std::memory_order_relaxed);
             for(auto&& sensor : _available_ros_sensors)
             {
                 std::string module_name(rs2_to_ros(sensor->get_info(RS2_CAMERA_INFO_NAME)));

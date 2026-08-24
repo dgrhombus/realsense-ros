@@ -23,6 +23,8 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+// Rhombus: frame-stall watchdog clock.
+#include <ctime>
 #include <rclcpp/clock.hpp>
 #include <fstream>
 #include <image_publisher.h>
@@ -36,6 +38,15 @@
 #include "align_depth_filter.h"
 
 using namespace realsense2_camera;
+
+// Rhombus: CLOCK_MONOTONIC in ms for the frame-stall watchdog — immune to
+// wall-clock jumps (librealsense GLOBAL_TIME convergence, NTP steps).
+int64_t BaseRealSenseNode::monotonicMs()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
 
 SyncedImuPublisher::SyncedImuPublisher(rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher, 
                                        std::size_t waiting_list_size):
@@ -555,6 +566,10 @@ void BaseRealSenseNode::imu_callback(rs2::frame frame)
 
 void BaseRealSenseNode::frame_callback(rs2::frame frame)
 {
+    // Rhombus: liveness stamp for the frame-stall watchdog (one relaxed
+    // atomic store per callback; the monitoring thread does the comparing).
+    _last_frame_ms.store(monotonicMs(), std::memory_order_relaxed);
+
     if (_synced_imu_publisher)
         _synced_imu_publisher->Pause();
     double frame_time = frame.get_timestamp();

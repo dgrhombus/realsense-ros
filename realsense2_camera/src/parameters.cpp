@@ -64,6 +64,21 @@ void BaseRealSenseNode::getParameters()
     }
     _parameters_names.push_back(param_name);
 
+    // Rhombus: frame-stall watchdog. While video sensors are streaming, no
+    // frame for this many seconds => FATAL log + process exit(1), so the
+    // supervising agent restarts the node instead of librealsense spinning
+    // kernel-level errors (QBUF ENODEV) at frame rate on a dead USB link.
+    // 0 (default) disables — stock behaviour for non-Rhombus configs.
+    param_name = std::string("frame_stall_exit_sec");
+    _frame_stall_exit_sec = _parameters->setParam<double>(param_name, 0.);
+    if (_frame_stall_exit_sec < 0.)
+    {
+        ROS_ERROR_STREAM("invalid frame_stall_exit_sec " << _frame_stall_exit_sec
+                         << " (must be >= 0) — using 0 (watchdog disabled)");
+        _frame_stall_exit_sec = 0.;
+    }
+    _parameters_names.push_back(param_name);
+
     param_name = std::string("publish_tf");
     _publish_tf = _parameters->setParam<bool>(param_name, PUBLISH_TF);
     _parameters_names.push_back(param_name);

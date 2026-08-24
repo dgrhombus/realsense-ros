@@ -381,6 +381,22 @@ namespace realsense2_camera
         bool _color_ros_downscale_warned = false;  // one-shot non-YUYV fallback warning
         rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr _color_full_info_publisher;
 
+        // Rhombus: frame-stall watchdog ("frame_stall_exit_sec" param, 0 =
+        // disabled = stock behaviour). While any video sensor is started
+        // (_frame_stall_armed), frame_callback stamps _last_frame_ms; the
+        // monitoringProfileChanges thread exits the PROCESS when the stamp
+        // goes stale — a dying USB link otherwise leaves librealsense
+        // spinning QBUF errors at frame rate forever (the device watcher
+        // does not fire when the kernel tears the nodes down under a live
+        // handle), and the supervisor's restart ladder is the recovery
+        // path. Atomics: stamped on the librealsense callback thread,
+        // armed/disarmed on the sensor start/stop paths, read on the
+        // monitoring thread.
+        double _frame_stall_exit_sec = 0.;
+        std::atomic<bool> _frame_stall_armed{false};
+        std::atomic<int64_t> _last_frame_ms{0};
+        static int64_t monotonicMs();
+
         float _depth_scale_meters;
         float _clipping_distance;
 
