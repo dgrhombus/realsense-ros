@@ -370,10 +370,13 @@ namespace realsense2_camera
         uint32_t _color_loopback_h = 0;
         std::vector<uint8_t> _color_loopback_buf;
         unsigned _color_loopback_drop_count = 0;  // rate-limits ring-full warnings
+        int _color_loopback_frame_skip = 1;       // "color_v4l2loopback_frame_skip" param (1 = every frame)
+        uint64_t _color_loopback_frame_counter = 0;  // callback thread only — no locking
 
         // Rhombus: reduced-rate/resolution ROS color publish (see
         // publishDownscaledColor). The loopback tee above always carries the
-        // full sensor frames and is unaffected by these. All state below is
+        // full-resolution sensor frames (at its own frame skip) and is
+        // unaffected by these. All state below is
         // touched only on the librealsense callback thread — no locking.
         int _color_ros_downscale = 1;    // "color_ros_downscale" param (1 = off)
         int _color_ros_frame_skip = 1;   // "color_ros_frame_skip" param (1 = off)

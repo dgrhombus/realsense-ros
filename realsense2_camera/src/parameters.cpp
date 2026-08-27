@@ -35,10 +35,27 @@ void BaseRealSenseNode::getParameters()
     _color_loopback_device = _parameters->setParam<std::string>(param_name, "");
     _parameters_names.push_back(param_name);
 
+    // Rhombus: tee frame skip. color_v4l2loopback_frame_skip N writes every
+    // Nth color frame to the loopback (skipped frames do no copy/convert/write
+    // work) and advertises sensor_fps/N as the device frame interval via
+    // VIDIOC_S_PARM so v4l2src negotiates that rate directly. The sensor keeps
+    // its own (higher) rate — it caps auto-exposure time, so 30 fps capture
+    // means less motion blur than a 15 fps capture would. Default 1 = every frame.
+    param_name = std::string("color_v4l2loopback_frame_skip");
+    _color_loopback_frame_skip = _parameters->setParam<int>(param_name, 1);
+    if (_color_loopback_frame_skip < 1)
+    {
+        ROS_ERROR_STREAM("invalid color_v4l2loopback_frame_skip " << _color_loopback_frame_skip
+                         << " (must be >= 1) — using 1 (tee every frame)");
+        _color_loopback_frame_skip = 1;
+    }
+    _parameters_names.push_back(param_name);
+
     // Rhombus: reduced ROS publish for the color stream. The loopback tee above
-    // always carries the full sensor resolution/rate (video-agent needs 720p30);
-    // the ROS consumers (depth registration, rgbd_sync) don't, and full-res
-    // color is ~55 MB/s of DDS per camera. color_ros_frame_skip N publishes
+    // always carries the full sensor resolution (video-agent needs 720p) at
+    // sensor_fps / color_v4l2loopback_frame_skip; the ROS consumers (depth
+    // registration, rgbd_sync) need neither the resolution nor the rate, and
+    // full-res color is ~55 MB/s of DDS per camera. color_ros_frame_skip N publishes
     // every Nth color frame (skipped frames do no conversion/serialization
     // work); color_ros_downscale N publishes 1/N-size YUYV with intrinsics
     // scaled to match on color/camera_info, while the unscaled factory

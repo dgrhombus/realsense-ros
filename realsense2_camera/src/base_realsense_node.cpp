@@ -739,6 +739,12 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
 // "color_v4l2loopback_device" param is set (empty default = no-op).
 void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_frame)
 {
+    // Frame skip first, before any open/convert/write work: with
+    // color_v4l2loopback_frame_skip N only every Nth frame reaches the ring.
+    if (_color_loopback_frame_skip > 1 &&
+        (_color_loopback_frame_counter++ % static_cast<uint64_t>(_color_loopback_frame_skip)) != 0)
+        return;
+
     const uint32_t w = static_cast<uint32_t>(color_frame.get_width()) & ~1u;  // YUYV pairs need even width
     const uint32_t h = static_cast<uint32_t>(color_frame.get_height());
     if (w == 0 || h == 0)
@@ -781,12 +787,32 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
             ::close(fd);
             return;
         }
+        // Advertise the tee rate (sensor fps / frame skip) as the device frame
+        // interval. v4l2loopback stores this for the CAPTURE side too, so the
+        // video agent's v4l2src negotiates framerate=<tee rate>/1 straight
+        // from the device instead of the module's 30 fps default. A failure
+        // here is only a warning: v4l2src issues its own S_PARM, and a real
+        // rate mismatch then fails loudly at gst caps negotiation.
+        const int sensor_fps = color_frame.get_profile().fps();
+        struct v4l2_streamparm parm;
+        std::memset(&parm, 0, sizeof(parm));
+        parm.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        parm.parm.output.timeperframe.numerator = static_cast<uint32_t>(_color_loopback_frame_skip);
+        parm.parm.output.timeperframe.denominator = static_cast<uint32_t>(sensor_fps > 0 ? sensor_fps : 30);
+        if (::ioctl(fd, VIDIOC_S_PARM, &parm) < 0)
+        {
+            ROS_WARN_STREAM("color v4l2loopback: VIDIOC_S_PARM " << parm.parm.output.timeperframe.denominator
+                            << "/" << parm.parm.output.timeperframe.numerator << " fps on "
+                            << _color_loopback_device << " failed: " << std::strerror(errno));
+        }
         _color_loopback_fd = fd;
         _color_loopback_w = w;
         _color_loopback_h = h;
         _color_loopback_buf.resize(static_cast<size_t>(w) * h * 2);
         ROS_INFO_STREAM("color v4l2loopback: streaming " << w << "x" << h << " YUYV to "
-                        << _color_loopback_device);
+                        << _color_loopback_device << " at " << sensor_fps << "/"
+                        << _color_loopback_frame_skip << " fps (frame skip "
+                        << _color_loopback_frame_skip << ")");
     }
 
     const rs2_format src_fmt = color_frame.get_profile().format();
@@ -849,7 +875,7 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
     if (wrote != want)
     {
         const int werrno = errno;
-        // ~5 s between warnings at 30 fps.
+        // ~5 s between warnings at a 30 fps tee (10 s at 15).
         if ((_color_loopback_drop_count++ % 150) == 0)
         {
             if (werrno == EAGAIN || werrno == EWOULDBLOCK)
@@ -864,8 +890,9 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
 
 // Rhombus: reduced-rate/reduced-resolution ROS publish path for the color
 // stream, used instead of publishFrame when color_ros_frame_skip and/or
-// color_ros_downscale are set. The v4l2loopback tee always receives the full
-// sensor frames before this runs — this only affects what DDS carries. With
+// color_ros_downscale are set. The v4l2loopback tee always receives the full-res
+// sensor frames (at its own frame skip) before this runs — this only affects
+// what DDS carries. With
 // color_ros_frame_skip N, only every Nth frame is published and skipped frames
 // do no conversion or serialization work at all. With color_ros_downscale N,
 // the published image is nearest-neighbor-decimated YUYV (output pixel i
