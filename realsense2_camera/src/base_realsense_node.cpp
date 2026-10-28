@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
@@ -605,7 +606,7 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
         // before filters/publish — lowest-latency hand-off to video-agent, which
         // reads the loopback while librealsense keeps the physical camera.
         if (original_color_frame && !_color_loopback_device.empty())
-            teeColorToV4l2Loopback(original_color_frame);
+            teeColorToV4l2Loopback(original_color_frame, t);
 
         ROS_DEBUG("num_filters: %d", static_cast<int>(_filters.size()));
         for (auto filter_it : _filters)
@@ -708,7 +709,7 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
             }
             // Rhombus: tee single (unsynced) color frames to the loopback too.
             if (stream_type == RS2_STREAM_COLOR && frame.is<rs2::video_frame>() && !_color_loopback_device.empty())
-                teeColorToV4l2Loopback(frame.as<rs2::video_frame>());
+                teeColorToV4l2Loopback(frame.as<rs2::video_frame>(), t);
             // Rhombus: color takes the reduced publish path when configured
             // (the tee above already got the full-res frame).
             if (stream_type == RS2_STREAM_COLOR && colorRosReduceEnabled())
@@ -737,7 +738,7 @@ void BaseRealSenseNode::frame_callback(rs2::frame frame)
 // SLAM (V4L2 and librealsense cannot share one UVC interface). Runs on the
 // librealsense callback thread — no DDS/ROS in the path. Enabled only when the
 // "color_v4l2loopback_device" param is set (empty default = no-op).
-void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_frame)
+void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_frame, const rclcpp::Time& t)
 {
     // Frame skip first, before any open/convert/write work: with
     // color_v4l2loopback_frame_skip N only every Nth frame reaches the ring.
@@ -755,14 +756,12 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
     {
         if (_color_loopback_fd >= 0)
         {
+            for (uint8_t* p : _color_loopback_bufs)
+                ::munmap(p, _color_loopback_buf_len);
+            _color_loopback_bufs.clear();
             ::close(_color_loopback_fd);
             _color_loopback_fd = -1;
         }
-        // O_NONBLOCK: never let a slow/stalled consumer (video-agent) block the
-        // librealsense capture thread. A full v4l2loopback ring returns EAGAIN on
-        // write and we drop the frame (see below) instead of freezing capture,
-        // which would otherwise throttle the color + aligned-depth ROS topics and
-        // starve RTAB-Map's rgbd_sync.
         int fd = ::open(_color_loopback_device.c_str(), O_WRONLY | O_NONBLOCK);
         if (fd < 0)
         {
@@ -805,10 +804,54 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
                             << "/" << parm.parm.output.timeperframe.numerator << " fps on "
                             << _color_loopback_device << " failed: " << std::strerror(errno));
         }
+        // MMAP streaming, not write(): v4l2loopback copies a QBUF'd OUTPUT
+        // buffer's timestamp to the reader, but stamps write() at write time.
+        // 4 = the max_buffers the v4l2loopback module is loaded with.
+        struct v4l2_requestbuffers req;
+        std::memset(&req, 0, sizeof(req));
+        req.count = 4;
+        req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        req.memory = V4L2_MEMORY_MMAP;
+        if (::ioctl(fd, VIDIOC_REQBUFS, &req) < 0)
+        {
+            ROS_WARN_STREAM("color v4l2loopback: VIDIOC_REQBUFS on " << _color_loopback_device
+                            << " failed: " << std::strerror(errno));
+            ::close(fd);
+            return;
+        }
+        std::vector<uint8_t*> bufs;
+        size_t len = 0;
+        for (uint32_t i = 0; i < req.count; ++i)
+        {
+            struct v4l2_buffer b;
+            std::memset(&b, 0, sizeof(b));
+            b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+            b.memory = V4L2_MEMORY_MMAP;
+            b.index = i;
+            if (::ioctl(fd, VIDIOC_QUERYBUF, &b) < 0)
+                break;
+            void* p = ::mmap(nullptr, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
+            if (p == MAP_FAILED)
+                break;
+            bufs.push_back(static_cast<uint8_t*>(p));
+            len = b.length;
+        }
+        int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        if (bufs.size() != req.count || ::ioctl(fd, VIDIOC_STREAMON, &type) < 0)
+        {
+            ROS_WARN_STREAM("color v4l2loopback: buffer mmap/STREAMON on " << _color_loopback_device
+                            << " failed: " << std::strerror(errno));
+            for (uint8_t* p : bufs)
+                ::munmap(p, len);
+            ::close(fd);
+            return;
+        }
         _color_loopback_fd = fd;
         _color_loopback_w = w;
         _color_loopback_h = h;
-        _color_loopback_buf.resize(static_cast<size_t>(w) * h * 2);
+        _color_loopback_bufs = std::move(bufs);
+        _color_loopback_buf_len = len;
+        _color_loopback_next = 0;
         ROS_INFO_STREAM("color v4l2loopback: streaming " << w << "x" << h << " YUYV to "
                         << _color_loopback_device << " at " << sensor_fps << "/"
                         << _color_loopback_frame_skip << " fps (frame skip "
@@ -818,7 +861,27 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
     const rs2_format src_fmt = color_frame.get_profile().format();
     const uint8_t* src = reinterpret_cast<const uint8_t*>(color_frame.get_data());
     const int src_stride = color_frame.get_stride_in_bytes();
-    uint8_t* dst = _color_loopback_buf.data();
+    // Warnings are rate-limited (single librealsense callback thread, no locking):
+    // ~5 s between warnings at a 30 fps tee (10 s at 15).
+    const auto warn_ioctl = [this](const char* what) {
+        if ((_color_loopback_drop_count++ % 150) == 0)
+            ROS_WARN_STREAM("color v4l2loopback: " << what << " on " << _color_loopback_device
+                            << " failed: " << std::strerror(errno));
+    };
+    // QUERYBUF returns the slot v4l2loopback will fill (0.13 folds the index
+    // after a reader shrinks the ring); advance from that slot.
+    struct v4l2_buffer buf;
+    std::memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    buf.index = _color_loopback_next;
+    if (::ioctl(_color_loopback_fd, VIDIOC_QUERYBUF, &buf) < 0)
+    {
+        warn_ioctl("VIDIOC_QUERYBUF");
+        return;
+    }
+    const uint32_t slot = buf.m.offset / _color_loopback_buf_len;
+    _color_loopback_next = (slot + 1) % static_cast<uint32_t>(_color_loopback_bufs.size());
+    uint8_t* dst = _color_loopback_bufs[slot];
 
     if (src_fmt == RS2_FORMAT_YUYV)
     {
@@ -864,28 +927,22 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
         return;
     }
 
-    // Non-blocking write: if the loopback ring is full (consumer not keeping up)
-    // the write returns -1/EAGAIN — drop this frame rather than block the capture
-    // thread. Warnings are rate-limited via a drop counter (this runs on the single
-    // librealsense callback thread, so no locking is needed) so a lagging consumer
-    // can't spam the log at frame rate.
-    const ssize_t want = static_cast<ssize_t>(_color_loopback_buf.size());
-    const ssize_t wrote = ::write(_color_loopback_fd, _color_loopback_buf.data(),
-                                  _color_loopback_buf.size());
-    if (wrote != want)
-    {
-        const int werrno = errno;
-        // ~5 s between warnings at a 30 fps tee (10 s at 15).
-        if ((_color_loopback_drop_count++ % 150) == 0)
-        {
-            if (werrno == EAGAIN || werrno == EWOULDBLOCK)
-                ROS_WARN_STREAM("color v4l2loopback: ring full on " << _color_loopback_device
-                                << " — dropping color frames (consumer not keeping up)");
-            else
-                ROS_WARN_STREAM("color v4l2loopback: short/failed write to " << _color_loopback_device
-                                << ": " << std::strerror(werrno));
-        }
-    }
+    // Stamp with the capture time `t` (the ROS header stamp) on CLOCK_REALTIME:
+    // v4l2src accepts realtime driver stamps, and they stay above the MONOTONIC
+    // stamps v4l2loopback 0.13 resets every buffer to on each REQBUFS. v4l2src
+    // ignores driver stamps for the rest of the pipeline's life once one is
+    // ahead of now or goes backward, and librealsense's global-time estimate
+    // steps during warm-up, so keep them non-decreasing and not ahead of now.
+    struct timespec now;
+    ::clock_gettime(CLOCK_REALTIME, &now);
+    const int64_t now_us = now.tv_sec * 1000000LL + now.tv_nsec / 1000;
+    const int64_t ts_us = std::max(std::min(t.nanoseconds() / 1000, now_us), _color_loopback_last_ts_us);
+    _color_loopback_last_ts_us = ts_us;
+    buf.bytesused = w * h * 2;
+    buf.timestamp.tv_sec = ts_us / 1000000;
+    buf.timestamp.tv_usec = ts_us % 1000000;
+    if (::ioctl(_color_loopback_fd, VIDIOC_QBUF, &buf) < 0)
+        warn_ioctl("VIDIOC_QBUF");
 }
 
 // Rhombus: reduced-rate/reduced-resolution ROS publish path for the color

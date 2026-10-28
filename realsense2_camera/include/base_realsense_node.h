@@ -324,7 +324,7 @@ namespace realsense2_camera
         void frame_callback(rs2::frame frame);
         // Rhombus: tee a color frame to a v4l2loopback OUTPUT device so a second
         // consumer (video-agent) can read RGB while librealsense owns the camera.
-        void teeColorToV4l2Loopback(const rs2::video_frame& color_frame);
+        void teeColorToV4l2Loopback(const rs2::video_frame& color_frame, const rclcpp::Time& t);
         // Rhombus: reduced ROS publish path for the color stream (frame skip
         // and/or YUYV downscale with intrinsics scaled to match); replaces
         // publishFrame for COLOR when active. See the definition for rationale.
@@ -368,8 +368,11 @@ namespace realsense2_camera
         int _color_loopback_fd = -1;
         uint32_t _color_loopback_w = 0;
         uint32_t _color_loopback_h = 0;
-        std::vector<uint8_t> _color_loopback_buf;
-        unsigned _color_loopback_drop_count = 0;  // rate-limits ring-full warnings
+        std::vector<uint8_t*> _color_loopback_bufs;  // mmap'd OUTPUT buffers
+        size_t _color_loopback_buf_len = 0;
+        uint32_t _color_loopback_next = 0;           // next buffer index (round robin)
+        int64_t _color_loopback_last_ts_us = 0;      // last queued timestamp, CLOCK_REALTIME
+        unsigned _color_loopback_drop_count = 0;  // rate-limits ioctl failure warnings
         int _color_loopback_frame_skip = 1;       // "color_v4l2loopback_frame_skip" param (1 = every frame)
         uint64_t _color_loopback_frame_counter = 0;  // callback thread only — no locking
 
