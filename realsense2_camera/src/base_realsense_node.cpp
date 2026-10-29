@@ -763,7 +763,7 @@ void BaseRealSenseNode::teeColorToV4l2Loopback(const rs2::video_frame& color_fra
             ::close(_color_loopback_fd);
             _color_loopback_fd = -1;
         }
-        int fd = ::open(_color_loopback_device.c_str(), O_WRONLY | O_NONBLOCK);
+        int fd = ::open(_color_loopback_device.c_str(), O_RDWR | O_NONBLOCK);
         if (fd < 0)
         {
             ROS_WARN_STREAM("color v4l2loopback: cannot open " << _color_loopback_device
